@@ -29,8 +29,7 @@ from app.schemas.sla_quarterly_aggregate import (
     QuarterlyAggregateResponse,
 )
 from app.services.sla_compliance_service import SlaComplianceService
-from app.utilities.project_anchor import project_anchor
-from app.utilities.quarter import parse_quarter_key, quarter_of
+from app.utilities.project_anchor import resolve_quarter_key
 
 router = APIRouter(tags=["sla-compliance"])
 
@@ -645,21 +644,7 @@ def sla_quarterly_aggregate(
     db: Annotated[Session, Depends(get_db)],
     quarter: Optional[str] = None,   # ?quarter=Y1-Q2 or ?quarter=2026-05-10
 ):
-    from datetime import date as _dt_date
-    anchor = project_anchor(db, project_id)  # quarters are project-start-anchored
-    if not quarter:
-        qk = quarter_of(_dt_date.today(), anchor)
-    else:
-        try:
-            if "-Q" in quarter.upper():
-                qk = parse_quarter_key(quarter, anchor)
-            else:
-                qk = quarter_of(_dt_date.fromisoformat(quarter), anchor)
-        except (ValueError, IndexError) as exc:
-            raise ValidationError(
-                f"Invalid quarter '{quarter}' — use 'Y1-Q2' or an ISO date.",
-                code="invalid_quarter",
-            ) from exc
+    qk = resolve_quarter_key(db, project_id, quarter)
 
     svc = SlaComplianceService(db)
     # Refresh first so the response reflects the latest evaluation rows —
@@ -669,7 +654,10 @@ def sla_quarterly_aggregate(
 
     from decimal import Decimal as _D
     from app.models.sla_definition import SlaDefinition
-    from app.services.quarterly_settlement_service import _TRACK_B_RULES
+    from app.services.quarterly_settlement_service import (
+        _TRACK_B_RULES,
+        _collapse_ld_by_sla,
+    )
 
     # Batch-load ld_formula_rule per SLA so each item can surface its Track.
     sla_ids = {r.sla_id for r in rows}
@@ -693,14 +681,19 @@ def sla_quarterly_aggregate(
             item.ld_track = "A"
         return item
 
-    # Uncapped total sums ONLY explicitly-classified Track B rows.
-    # Track A and unclassified rows are excluded — the settlement layer
-    # uses the same rule, so this stays in sync with what actually
-    # flows into the money math.
-    uncapped = sum(
-        (r.ld_percent or _D("0")) for r in rows
-        if (rule_by_sla.get(r.sla_id) or "") in _TRACK_B_RULES
-    ) or _D("0")
+    # Uncapped total = Σ of ONE %LD per SLA (each SLA's worst across its
+    # per-mapping rows), over Track-B rows only. RFP §5.28.1.d.f is the
+    # "Sum of %LD applicable to all the SLs" — one %LD per SLA, so an SLA
+    # mapped to N activities must NOT be counted N times (2 breaching
+    # activities on one SLA would read 8% instead of its 4%). Collapse per
+    # sla_id with the SAME rule the settlement uses (_collapse_ld_by_sla), so
+    # this audit total matches the money math's sum_ld_percent. "Uncapped"
+    # still means the 10% quarter cap is NOT applied here — that lives in the
+    # settlement — only the per-mapping double-count is removed.
+    track_b_rows = [
+        r for r in rows if (rule_by_sla.get(r.sla_id) or "") in _TRACK_B_RULES
+    ]
+    uncapped = sum(_collapse_ld_by_sla(track_b_rows).values(), _D("0"))
 
     resp = QuarterlyAggregateResponse(
         project_id=project_id,
